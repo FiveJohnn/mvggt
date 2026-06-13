@@ -1,0 +1,51 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.env
+.venv/
+venv/
+env/
+conda/
+
+# Training/runtime outputs
+outputs/
+output/
+logs/
+log/
+wandb/
+runs/
+tensorboard/
+.hydra/
+.gradio/
+checkpoints/
+checkpoint*/
+ckpts/
+
+# Model/checkpoint artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+
+# Local datasets / generated heavy files
+scans/
+posed_images/
+*.npy
+*.npz
+*.tar
+*.zip
+*.gz
+*.pdf
+
+# Local downloaded paper/search artifacts
+paper_2601_06874_src/
+cvpr-2026-*.json
+cvpr2026_*.html

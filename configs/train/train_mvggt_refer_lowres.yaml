@@ -1,0 +1,157 @@
+# @package _global_
+
+trainer: trainers.mvggt_trainer.MVGGTTrainer
+
+train:
+  image_num_range: [4, 4]
+  max_img_per_gpu: 64
+
+  # low resolution
+  resolution: 
+    - [224, 224]
+
+  num_epoch: 30
+  iters_per_epoch: 1000
+  print_freq: 10
+  num_workers: 8
+  batch_size: 1
+  base_seed: 666
+  model_dtype: bf16
+  dynamo_backend: "NO"
+  dynamic_compile: true
+  gradient_accumulation_steps: 1
+  clip_grad: 1.0
+  clip_loss: 1000
+  seed: 42
+  resume: null
+  auto_resume: true
+  start_epoch: 0
+  global_step: 0
+  world_size: 1
+  rank: -1
+  gpu: -1
+  dist_on_itp: false
+  find_unused_parameters: false
+  distributed: false
+  dist_url: env://
+  dist_backend: "nccl"
+  optimizer:
+    type: AdamW
+    lr: 1e-4
+    weight_decay: 5e-2
+    betas: [0.9, 0.95]
+    verbose: true
+    filter_bias_and_bn: true
+    encoder_lr: 5e-6
+  lr_scheduler:
+    type: OneCycleLR
+    max_lr: ${train.optimizer.lr}
+    pct_start: 0.0
+    anneal_strategy: cos
+    div_factor: 1000.0
+    final_div_factor: 100.0
+    total_steps: -1
+  eval_only: false
+  # resume: ckpts/best_model
+test:
+    num_workers: 8
+    batch_size: 1
+    max_img_per_gpu: 64
+    print_freq: 10
+    iters_per_test: -1
+    image_num_range: [8, 8]
+    # low resolution
+    resolution: 
+    - [518, 336]
+
+model:
+  _target_: mvggt.models.mvggt_training.MVGGT
+  pos_type: rope100
+  decoder_size: large
+  freeze_encoder: true
+  use_global_points: false
+  train_conf: false
+  num_dec_blk_not_to_checkpoint: 4
+  ckpt: null
+  use_referring_segmentation: true
+  freeze_visual_modules: true
+  pretrained_model_name_or_path: ckpts/Pi3
+  text_model_name: ckpts/roberta-base
+  use_masked_attn: true
+  num_fusion_layers: 12
+  use_cross_view_refiner: true
+  use_light_routing: false
+  light_route_prune_views: true
+  light_route_view_keep_num: 5
+  light_route_gt_keep: true
+  light_route_use_teacher: true
+  light_route_prune_tokens: false
+  light_route_token_keep_ratio: 0.45
+  light_route_token_temperature: 1.0
+  light_route_token_hard_eval: true
+  light_route_anchor_stride: 4
+  light_route_hidden_dim: 256
+  light_route_view_diversity_weight: 0.35
+  light_route_pose_diversity_weight: 0.25
+  light_route_gt_boost: 1000.0
+  light_route_token_gt_boost: 1000.0
+  light_route_token_anchor_boost: 5.0
+  light_route_token_completion_weight: 0.5
+  light_route_warmup_epochs: 0
+  light_route_anneal_epochs: 0
+  skip_geometry_for_referring: false
+  empty_view_logit: -20.0
+  refiner_hidden_dim: 256
+  refiner_num_heads: 8
+  refiner_num_blocks: 3
+  refiner_num_points: 5
+  refiner_num_sources: 2
+  refiner_iters: 2
+  refiner_fusion_size: 12
+  refiner_gt_source_prob: 0.7
+  refiner_match_temperature: 10.0
+  refiner_detach_matching: true
+loss:
+  train_loss:
+    _target_: mvggt.models.loss.MVGGTLoss
+    train_conf: false
+    use_referring_segmentation: true
+    referring_loss_weight_dict:
+      loss_mask: 1.0
+      loss_dice: 1.0
+      loss_focal: 2.0
+      loss_coarse_mask: 0.5
+      loss_coarse_dice: 0.5
+      loss_coarse_focal: 1.0
+      loss_cross_view_consistency: 0.2
+      loss_view_target: 0.0
+      loss_view_budget: 0.0
+      loss_view_recall: 0.0
+      loss_view_no_target: 0.0
+      loss_view_diversity: 0.0
+      loss_token_budget: 0.0
+      loss_token_target: 0.0
+      loss_mask_distill: 0.0
+      distill_temperature: 2.0
+
+  test_loss:
+    _target_: mvggt.models.loss.MVGGTLoss
+    train_conf: false
+    use_referring_segmentation: true
+    referring_loss_weight_dict:
+      loss_mask: 1.0
+      loss_dice: 1.0
+      loss_focal: 0.0
+      loss_coarse_mask: 0.0
+      loss_coarse_dice: 0.0
+      loss_coarse_focal: 0.0
+      loss_cross_view_consistency: 0.0
+      loss_view_target: 0.0
+      loss_view_budget: 0.0
+      loss_view_recall: 0.0
+      loss_view_no_target: 0.0
+      loss_view_diversity: 0.0
+      loss_token_budget: 0.0
+      loss_token_target: 0.0
+      loss_mask_distill: 0.0
+      distill_temperature: 2.0
