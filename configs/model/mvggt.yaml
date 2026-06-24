@@ -11,39 +11,6 @@ model:
     ckpt: null
     use_referring_segmentation: true
     freeze_visual_modules: false
-    num_fusion_layers: 12
-    use_cross_view_refiner: false
-    refiner_hidden_dim: 256
-    refiner_num_heads: 8
-    refiner_num_blocks: 3
-    refiner_num_points: 5
-    refiner_num_sources: 2
-    refiner_iters: 2
-    refiner_fusion_size: 12
-    refiner_gt_source_prob: 0.7
-    refiner_match_temperature: 10.0
-    refiner_detach_matching: true
-    use_light_routing: false
-    light_route_prune_views: true
-    light_route_view_keep_num: 5
-    light_route_gt_keep: true
-    light_route_use_teacher: true
-    light_route_prune_tokens: false
-    light_route_token_keep_ratio: 0.45
-    light_route_token_temperature: 1.0
-    light_route_token_hard_eval: true
-    light_route_anchor_stride: 4
-    light_route_hidden_dim: 256
-    light_route_view_diversity_weight: 0.35
-    light_route_pose_diversity_weight: 0.25
-    light_route_gt_boost: 1000.0
-    light_route_token_gt_boost: 1000.0
-    light_route_token_anchor_boost: 5.0
-    light_route_token_completion_weight: 0.5
-    light_route_warmup_epochs: 0
-    light_route_anneal_epochs: 0
-    skip_geometry_for_referring: false
-    empty_view_logit: -20.0
 loss:
     train_loss: 
         _target_: mvggt.models.loss.MVGGTLoss

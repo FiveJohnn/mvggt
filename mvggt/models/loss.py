@@ -281,38 +281,6 @@ def dice_loss(
     return final_loss
 
 
-def sigmoid_focal_loss(
-    inputs: torch.Tensor,
-    targets: torch.Tensor,
-    alpha: float = 0.25,
-    gamma: float = 2.0,
-):
-    targets = targets.float()
-    prob = inputs.sigmoid()
-    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-    p_t = prob * targets + (1.0 - prob) * (1.0 - targets)
-    loss = ce_loss * ((1.0 - p_t) ** gamma)
-    if alpha >= 0:
-        alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
-        loss = alpha_t * loss
-    return loss.mean()
-
-
-def balanced_bce_with_logits(
-    inputs: torch.Tensor,
-    targets: torch.Tensor,
-    pos_weight: float = 1.0,
-    neg_weight: float = 0.25,
-):
-    targets = targets.float()
-    loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-    pos_mask = (targets > 0.5).to(loss.dtype)
-    neg_mask = (targets <= 0.5).to(loss.dtype)
-    pos_loss = (loss * pos_mask).sum() / pos_mask.sum().clamp_min(1.0)
-    neg_loss = (loss * neg_mask).sum() / neg_mask.sum().clamp_min(1.0)
-    return float(pos_weight) * pos_loss + float(neg_weight) * neg_loss
-
-
 def iou_score(
     inputs: torch.Tensor,
     targets: torch.Tensor,
@@ -405,339 +373,33 @@ def iou_score_per_view(
     return score_per_view
 
 class ReferringMaskLoss(nn.Module):
-    def __init__(
-        self,
-        weight_dict=None,
-        layer_weight=0.5,
-        focal_alpha=0.25,
-        focal_gamma=2.0,
-        consistency_detach_source=True,
-    ):
+    def __init__(self, weight_dict=None, layer_weight=0.5,):
         super().__init__()
         self.weight_dict = weight_dict if weight_dict is not None else {'loss_mask': 1, 'loss_dice': 1}
         self.layer_weight = layer_weight
-        self.focal_alpha = focal_alpha
-        self.focal_gamma = focal_gamma
-        self.consistency_detach_source = consistency_detach_source
-        self.use_balanced_mask_bce = (
-            "mask_bce_pos_weight" in self.weight_dict
-            or "mask_bce_neg_weight" in self.weight_dict
-        )
-        self.mask_bce_pos_weight = float(self.weight_dict.get("mask_bce_pos_weight", 1.0))
-        self.mask_bce_neg_weight = float(self.weight_dict.get("mask_bce_neg_weight", 0.25))
-
-    def _weighted_sum(self, losses, mapping):
-        total = 0.0
-        for name, value in mapping.items():
-            total = total + self.weight_dict.get(name, 0.0) * value
-        return total
-
-    def _mask_bce_loss(self, pred_masks, gt_masks):
-        if not self.use_balanced_mask_bce:
-            return F.binary_cross_entropy_with_logits(pred_masks, gt_masks.float())
-        return balanced_bce_with_logits(
-            pred_masks,
-            gt_masks,
-            pos_weight=self.mask_bce_pos_weight,
-            neg_weight=self.mask_bce_neg_weight,
-        )
-
-    def _basic_mask_losses(self, pred_masks, gt_masks, prefix=""):
-        name = lambda suffix: f"{prefix}_{suffix}" if prefix else suffix
-        losses = {
-            name("loss_mask"): self._mask_bce_loss(pred_masks, gt_masks),
-            name("loss_dice"): dice_loss(pred_masks, gt_masks),
-            name("loss_focal"): sigmoid_focal_loss(
-                pred_masks,
-                gt_masks,
-                alpha=self.focal_alpha,
-                gamma=self.focal_gamma,
-            ),
-            name("iou_score"): iou_score_global(pred_masks, gt_masks),
-            name("iou_score_in_frame_with_target"): iou_score(pred_masks, gt_masks),
-        }
-        return losses
-
-    def _project_target_points_to_source(self, target_points, source_pose, source_intrinsics, height, width):
-        source_w2c = se3_inverse(source_pose)
-        pts_cam = torch.einsum(
-            "ij,nhwj->nhwi",
-            source_w2c[:3],
-            homogenize_points(target_points),
-        )
-        z = pts_cam[..., 2].clamp_min(1e-6)
-        u = source_intrinsics[0, 0] * pts_cam[..., 0] / z + source_intrinsics[0, 2]
-        v = source_intrinsics[1, 1] * pts_cam[..., 1] / z + source_intrinsics[1, 2]
-        grid = torch.stack([2.0 * u / width - 1.0, 2.0 * v / height - 1.0], dim=-1)
-        finite = torch.isfinite(pts_cam).all(dim=-1) & torch.isfinite(grid).all(dim=-1)
-        valid = (
-            finite
-            & torch.isfinite(source_pose).all()
-            & torch.isfinite(source_intrinsics).all()
-            & (pts_cam[..., 2] > 0)
-            & (u > 0)
-            & (u < width - 1)
-            & (v > 0)
-            & (v < height - 1)
-        )
-        grid = torch.nan_to_num(grid, nan=0.0, posinf=2.0, neginf=-2.0).clamp(-2.0, 2.0)
-        return grid, valid
-
-    def _cross_view_consistency_loss(self, pred_masks, pred, gt):
-        required = ["refiner_source_masks", "refiner_source_indices", "refiner_source_scores"]
-        if not all(key in pred for key in required):
-            return pred_masks.sum() * 0.0
-
-        source_masks = pred["refiner_source_masks"]
-        source_indices = pred["refiner_source_indices"]
-        source_scores = pred["refiner_source_scores"]
-        if self.consistency_detach_source:
-            source_masks = source_masks.detach()
-
-        source_masks = torch.nan_to_num(source_masks.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-        source_scores = torch.nan_to_num(source_scores.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-        source_scores = source_scores / source_scores.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        target_logits = torch.nan_to_num(pred_masks.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        raw_points = gt["raw_points"]
-        raw_valid = gt["raw_valid_masks"]
-        raw_poses = gt["raw_camera_poses"]
-        intrinsics = gt["camera_intrinsics"]
-
-        B, V, H, W = target_logits.shape
-        S = source_masks.shape[1]
-        warped_sum = torch.zeros_like(target_logits)
-        valid_sum = torch.zeros_like(target_logits)
-
-        for b in range(B):
-            target_points = raw_points[b]
-            target_valid = raw_valid[b]
-            for s in range(S):
-                src_idx = int(source_indices[b, s].item())
-                grid, valid = self._project_target_points_to_source(
-                    target_points,
-                    raw_poses[b, src_idx],
-                    intrinsics[b, src_idx],
-                    H,
-                    W,
-                )
-                valid = valid & target_valid
-                src_mask = source_masks[b, s].float()[None, None].expand(V, -1, -1, -1)
-                sampled = F.grid_sample(
-                    src_mask,
-                    grid.float(),
-                    mode="bilinear",
-                    padding_mode="zeros",
-                    align_corners=False,
-                )[:, 0]
-                sampled = torch.nan_to_num(sampled, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-                weight = source_scores[b, s].to(target_logits.dtype)
-                warped_sum[b] = warped_sum[b] + sampled.to(target_logits.dtype) * valid.to(target_logits.dtype) * weight
-                valid_sum[b] = valid_sum[b] + valid.to(target_logits.dtype) * weight
-
-        valid = valid_sum > 1e-4
-        if not valid.any():
-            return pred_masks.sum() * 0.0
-
-        warped_target = (warped_sum / valid_sum.clamp_min(1e-6)).detach().clamp(1e-4, 1 - 1e-4)
-        return F.binary_cross_entropy_with_logits(
-            target_logits[valid],
-            warped_target[valid],
-        )
 
     def forward(self, pred, gt, current_epoch=None, total_epochs=None):
         pred_masks = pred['referring_mask_pred']
-        pred_masks = torch.nan_to_num(pred_masks.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-30.0, 30.0)
-        gt_masks = torch.nan_to_num(gt['referring_masks'].float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0) # (B, V, H, W)
-        view_has_target = gt_masks.sum(dim=(-1, -2)) > 0 # (B, V)
+        gt_masks = gt['referring_masks'] # (B, V, H, W)
+        
+        num_masks = gt_masks.shape[0] * gt_masks.shape[1]
 
-        losses = self._basic_mask_losses(pred_masks, gt_masks)
+        losses = {}
+        losses["loss_mask"] = F.binary_cross_entropy_with_logits(pred_masks, gt_masks.float())
+        losses["loss_dice"] = dice_loss(pred_masks, gt_masks)
+        losses["iou_score"] = iou_score_global(pred_masks, gt_masks)
         iou_global_per_sample = iou_score_global_per_sample(pred_masks, gt_masks)
         iou_per_view = iou_score_per_view(pred_masks, gt_masks)
-        total_loss = self._weighted_sum(
-            losses,
-            {
-                "loss_mask": losses["loss_mask"],
-                "loss_dice": losses["loss_dice"],
-                "loss_focal": losses["loss_focal"],
-            },
-        )
-
-        if 'referring_mask_coarse_pred' in pred:
-            coarse_pred = torch.nan_to_num(pred['referring_mask_coarse_pred'].float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-30.0, 30.0)
-            coarse_losses = self._basic_mask_losses(coarse_pred, gt_masks, prefix="coarse")
-            losses.update(coarse_losses)
-            total_loss = total_loss + self._weighted_sum(
-                losses,
-                {
-                    "loss_coarse_mask": coarse_losses["coarse_loss_mask"],
-                    "loss_coarse_dice": coarse_losses["coarse_loss_dice"],
-                    "loss_coarse_focal": coarse_losses["coarse_loss_focal"],
-                },
-            )
-
-        consistency_weight = self.weight_dict.get("loss_cross_view_consistency", 0.0)
-        if consistency_weight > 0:
-            consistency_loss = self._cross_view_consistency_loss(pred_masks, pred, gt)
-            losses["loss_cross_view_consistency"] = consistency_loss
-            total_loss = total_loss + consistency_weight * consistency_loss
-
-        if 'routing_view_logits' in pred:
-            view_logits = torch.nan_to_num(pred['routing_view_logits'].float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-30.0, 30.0)
-            view_targets = view_has_target.to(dtype=view_logits.dtype)
-            loss_view_target = F.binary_cross_entropy_with_logits(view_logits, view_targets)
-            losses["loss_view_target"] = loss_view_target
-            total_loss = total_loss + self.weight_dict.get("loss_view_target", 0.0) * loss_view_target
-
-            view_keep_prob = pred.get('routing_view_keep_prob', torch.sigmoid(view_logits)).float()
-            view_keep_prob = torch.nan_to_num(view_keep_prob, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-            view_target_keep_ratio = pred.get('routing_view_target_keep_ratio', None)
-            if view_target_keep_ratio is not None:
-                view_target_keep_ratio = torch.as_tensor(
-                    view_target_keep_ratio,
-                    device=view_keep_prob.device,
-                    dtype=view_keep_prob.dtype,
-                )
-                loss_view_budget = (view_keep_prob.mean() - view_target_keep_ratio).square()
-                losses["loss_view_budget"] = loss_view_budget
-                total_loss = total_loss + self.weight_dict.get("loss_view_budget", 0.0) * loss_view_budget
-
-            positive_views = view_has_target.to(dtype=view_keep_prob.dtype)
-            negative_views = (~view_has_target).to(dtype=view_keep_prob.dtype)
-            positive_count_raw = positive_views.sum()
-            positive_count = positive_count_raw.clamp_min(1.0)
-            negative_count = negative_views.sum().clamp_min(1.0)
-
-            if 'routing_view_keep_mask' in pred:
-                hard_keep = torch.nan_to_num(
-                    pred['routing_view_keep_mask'].float(),
-                    nan=0.0,
-                    posinf=1.0,
-                    neginf=0.0,
-                ).clamp(0.0, 1.0)
-                if bool((positive_count_raw > 0).item()):
-                    target_view_recall = (hard_keep * positive_views).sum() / positive_count
-                else:
-                    target_view_recall = hard_keep.sum() * 0.0 + 1.0
-                losses["routing_target_view_recall"] = target_view_recall
-                losses["routing_dropped_target_rate"] = 1.0 - target_view_recall
-                losses["routing_kept_view_ratio"] = hard_keep.mean()
-                losses["routing_no_target_keep_rate"] = (hard_keep * negative_views).sum() / negative_count
-                if 'routing_schedule_progress' in pred:
-                    losses["routing_schedule_progress"] = torch.as_tensor(
-                        pred['routing_schedule_progress'],
-                        device=hard_keep.device,
-                        dtype=hard_keep.dtype,
-                    )
-
-            if bool((positive_count_raw > 0).item()):
-                soft_target_recall = (view_keep_prob * positive_views).sum() / positive_count
-                loss_view_recall = (1.0 - soft_target_recall).square()
-            else:
-                loss_view_recall = view_keep_prob.sum() * 0.0
-            losses["loss_view_recall"] = loss_view_recall
-            total_loss = total_loss + self.weight_dict.get("loss_view_recall", 0.0) * loss_view_recall
-
-            loss_view_no_target = (view_keep_prob * negative_views).sum() / negative_count
-            losses["loss_view_no_target"] = loss_view_no_target
-            total_loss = total_loss + self.weight_dict.get("loss_view_no_target", 0.0) * loss_view_no_target
-
-            if 'routing_view_similarity' in pred:
-                view_similarity = torch.nan_to_num(
-                    pred['routing_view_similarity'].float(),
-                    nan=0.0,
-                    posinf=1.0,
-                    neginf=-1.0,
-                ).clamp(-1.0, 1.0)
-                offdiag = ~torch.eye(view_similarity.shape[-1], dtype=torch.bool, device=view_similarity.device)[None]
-                pair_weight = view_keep_prob[:, :, None] * view_keep_prob[:, None, :]
-                pair_weight = pair_weight * offdiag.to(pair_weight.dtype)
-                redundant_similarity = view_similarity.clamp_min(0.0) * pair_weight
-                loss_view_diversity = redundant_similarity.sum() / pair_weight.sum().clamp_min(1e-6)
-                losses["loss_view_diversity"] = loss_view_diversity
-                total_loss = total_loss + self.weight_dict.get("loss_view_diversity", 0.0) * loss_view_diversity
-
-        if 'routing_token_keep_prob' in pred:
-            token_keep_prob = torch.nan_to_num(
-                pred['routing_token_keep_prob'].float(),
-                nan=0.0,
-                posinf=1.0,
-                neginf=0.0,
-            ).clamp(0.0, 1.0)
-            token_target_keep_ratio = pred.get('routing_token_target_keep_ratio', None)
-            if token_target_keep_ratio is not None:
-                token_target_keep_ratio = torch.as_tensor(
-                    token_target_keep_ratio,
-                    device=token_keep_prob.device,
-                    dtype=token_keep_prob.dtype,
-                )
-                loss_token_budget = (token_keep_prob.mean() - token_target_keep_ratio).square()
-                losses["loss_token_budget"] = loss_token_budget
-                total_loss = total_loss + self.weight_dict.get("loss_token_budget", 0.0) * loss_token_budget
-
-            B, V, H, W = gt_masks.shape
-            patch_h = max(1, H // 14)
-            patch_w = max(1, W // 14)
-            if token_keep_prob.shape[:2] == (B, V) and token_keep_prob.shape[-1] == patch_h * patch_w:
-                patch_targets = F.interpolate(
-                    gt_masks.reshape(B * V, 1, H, W).float(),
-                    size=(patch_h, patch_w),
-                    mode="area",
-                ).reshape(B, V, patch_h * patch_w).clamp(0.0, 1.0)
-                target_mass_raw = patch_targets.sum()
-                target_mass = target_mass_raw.clamp_min(1.0)
-                if bool((target_mass_raw > 0).item()):
-                    token_target_recall = (token_keep_prob * patch_targets).sum() / target_mass
-                    loss_token_target = (1.0 - token_target_recall).square()
-                else:
-                    token_target_recall = token_keep_prob.sum() * 0.0 + 1.0
-                    loss_token_target = token_keep_prob.sum() * 0.0
-                losses["routing_token_target_recall"] = token_target_recall
-                losses["routing_token_kept_ratio"] = (token_keep_prob > 0.5).float().mean()
-                if 'routing_token_keep_mask' in pred:
-                    token_keep_mask = torch.nan_to_num(
-                        pred['routing_token_keep_mask'].float(),
-                        nan=0.0,
-                        posinf=1.0,
-                        neginf=0.0,
-                    ).clamp(0.0, 1.0)
-                    losses["routing_sparse_token_ratio"] = token_keep_mask.mean()
-                    if bool((target_mass_raw > 0).item()):
-                        losses["routing_sparse_token_target_recall"] = (
-                            token_keep_mask * patch_targets
-                        ).sum() / target_mass
-                    else:
-                        losses["routing_sparse_token_target_recall"] = token_keep_mask.sum() * 0.0 + 1.0
-                if 'routing_token_completion_mask' in pred:
-                    losses["routing_token_completion_ratio"] = torch.nan_to_num(
-                        pred['routing_token_completion_mask'].float(),
-                        nan=0.0,
-                        posinf=1.0,
-                        neginf=0.0,
-                    ).clamp(0.0, 1.0).mean()
-                losses["loss_token_target"] = loss_token_target
-                total_loss = total_loss + self.weight_dict.get("loss_token_target", 0.0) * loss_token_target
-
-        if 'teacher_referring_mask_pred' in pred:
-            teacher_logits = torch.nan_to_num(
-                pred['teacher_referring_mask_pred'].float(),
-                nan=0.0,
-                posinf=20.0,
-                neginf=-20.0,
-            ).clamp(-30.0, 30.0)
-            distill_temperature = float(self.weight_dict.get("distill_temperature", 2.0))
-            teacher_prob = torch.sigmoid((teacher_logits / distill_temperature).detach())
-            loss_mask_distill = F.binary_cross_entropy_with_logits(
-                pred_masks / distill_temperature,
-                teacher_prob,
-            ) * (distill_temperature ** 2)
-            losses["loss_mask_distill"] = loss_mask_distill
-            total_loss = total_loss + self.weight_dict.get("loss_mask_distill", 0.0) * loss_mask_distill
-
+        # iou score just in frame with target
+        losses["iou_score_in_frame_with_target"] = iou_score(pred_masks, gt_masks)
+        total_loss = self.weight_dict['loss_mask'] * losses['loss_mask'] + self.weight_dict['loss_dice'] * losses['loss_dice']
         # Record the proportion of samples without a target, i.e., the proportion of samples where all views have no target.
-        sample_no_target = (view_has_target.float().sum(-1) == 0).float() # (B)
+        view_has_target = (gt_masks.sum(dim=(-1, -2)) > 0).float() # (B, V)
+        sample_no_target = (view_has_target.sum(-1) == 0).float() # (B)
         losses["rate_no_target"] = sample_no_target.mean()
 
         # Record the average ratio of frames with a target to the total number of frames in each sample.
+        view_has_target = gt_masks.sum(dim=(-1, -2)) > 0 # (B, V)
         rate_view_has_target = view_has_target.float().mean(-1) # (B)
         losses["rate_frame_with_target"] = rate_view_has_target.mean()
 
@@ -746,7 +408,7 @@ class ReferringMaskLoss(nn.Module):
         losses["rate_pixel_with_target"] = pixel_rate_per_view.mean()
 
         # Record the average pixel proportion of the target in frames that contain the target.
-        if bool(view_has_target.any().item()):
+        if view_has_target.any():
             rate_pixel_in_target_frame = pixel_rate_per_view[view_has_target].mean()
         else:
             rate_pixel_in_target_frame = torch.tensor(0.0, device=gt_masks.device)
@@ -756,8 +418,7 @@ class ReferringMaskLoss(nn.Module):
             layer_preds = pred['layer_referring_mask_preds']
             layer_losses = {}
             for i, layer_pred in enumerate(layer_preds):
-                layer_pred = torch.nan_to_num(layer_pred.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-30.0, 30.0)
-                layer_losses[f"loss_mask_layer_{i}"] = self._mask_bce_loss(layer_pred, gt_masks)
+                layer_losses[f"loss_mask_layer_{i}"] = F.binary_cross_entropy_with_logits(layer_pred, gt_masks.float())
                 layer_losses[f"loss_dice_layer_{i}"] = dice_loss(layer_pred, gt_masks)
                 layer_losses[f"iou_score_layer_{i}"] = iou_score_global(layer_pred, gt_masks)
 
@@ -795,15 +456,12 @@ class MVGGTLoss(nn.Module):
             )
 
     def prepare_gt(self, gt):
-        raw_points = torch.stack([view['pts3d'] for view in gt], dim=1)
+        gt_pts = torch.stack([view['pts3d'] for view in gt], dim=1)
         masks = torch.stack([view['valid_mask'] for view in gt], dim=1)
-        raw_poses = torch.stack([view['camera_pose'] for view in gt], dim=1)
-        camera_intrinsics = torch.stack([view['camera_intrinsics'] for view in gt], dim=1)
+        poses = torch.stack([view['camera_pose'] for view in gt], dim=1)
         if self.use_referring_segmentation and gt[0]['referring_mask'] is not None:
             referring_masks = torch.stack([view['referring_mask'] for view in gt], dim=1)
 
-        gt_pts = raw_points.clone()
-        poses = raw_poses.clone()
         B, N, H, W, _ = gt_pts.shape
 
         # transform to first frame camera coordinate
@@ -835,10 +493,6 @@ class MVGGTLoss(nn.Module):
             local_points=gt_local_pts,
             valid_masks=masks,
             camera_poses=poses,
-            raw_points=raw_points,
-            raw_valid_masks=masks,
-            raw_camera_poses=raw_poses,
-            camera_intrinsics=camera_intrinsics,
             referring_masks=referring_masks if self.use_referring_segmentation else None,
             dataset_names=dataset_names
         )
@@ -870,33 +524,20 @@ class MVGGTLoss(nn.Module):
 
     def forward(self, pred, gt_raw, current_epoch=None, total_epochs=None):
         gt = self.prepare_gt(gt_raw)
-        skip_geometry_loss = self.use_referring_segmentation and pred.get("skip_geometry_loss", False)
-        if not skip_geometry_loss:
-            pred = self.normalize_pred(pred, gt)
+        pred = self.normalize_pred(pred, gt)
 
         final_loss = 0.0
         details = dict()
 
         # Local Point Loss
-        if skip_geometry_loss:
-            zero = pred['referring_mask_pred'].sum() * 0.0
-            scale = torch.ones(gt['valid_masks'].shape[0], device=gt['valid_masks'].device, dtype=gt['raw_points'].dtype)
-            details.update(dict(
-                local_pts_loss=zero.detach(),
-                normal_loss=zero.detach(),
-                trans_loss=zero.detach(),
-                rot_loss=zero.detach(),
-            ))
-        else:
-            point_loss, point_loss_details, scale = self.point_loss(pred, gt)
-            final_loss += point_loss if not self.use_referring_segmentation else 0.0
-            details.update(point_loss_details)
+        point_loss, point_loss_details, scale = self.point_loss(pred, gt)
+        final_loss += point_loss if not self.use_referring_segmentation else 0.0
+        details.update(point_loss_details)
 
         # Camera Loss
-        if not skip_geometry_loss:
-            camera_loss, camera_loss_details = self.camera_loss(pred, gt, scale)
-            final_loss += camera_loss * 0.1 if not self.use_referring_segmentation else 0.0
-            details.update(camera_loss_details)
+        camera_loss, camera_loss_details = self.camera_loss(pred, gt, scale)
+        final_loss += camera_loss * 0.1 if not self.use_referring_segmentation else 0.0
+        details.update(camera_loss_details)
 
         if self.use_referring_segmentation and 'referring_mask_pred' in pred and 'referring_masks' in gt:
             referring_loss, referring_loss_details = self.referring_mask_loss(pred, gt, current_epoch=current_epoch, total_epochs=total_epochs)
