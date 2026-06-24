@@ -1023,52 +1023,6 @@ class BaseTrainer:
         metrics['acc25_per_view_invisible'], metrics['acc50_per_view_invisible'], metrics['iou_per_view_invisible_mean'] = calc_metrics(invisible_view_data)
         
         return metrics
-
-    def _zero_optimizer_grad(self):
-        try:
-            self.optimizer.zero_grad(set_to_none=True)
-        except TypeError:
-            self.optimizer.zero_grad()
-
-    def _inspect_gradients_before_clip(self, max_report=8):
-        total_sq_norm = 0.0
-        bad_grads = []
-
-        for name, param in self.model.named_parameters():
-            grad = param.grad
-            if grad is None:
-                continue
-
-            grad_detached = grad.detach()
-            finite_mask = torch.isfinite(grad_detached)
-            if not bool(finite_mask.all().item()):
-                bad_mask = ~finite_mask
-                bad_count = int(bad_mask.sum().item())
-                finite_count = int(finite_mask.sum().item())
-                if finite_count > 0:
-                    finite_values = grad_detached[finite_mask].float()
-                    finite_abs_max = float(finite_values.abs().max().item())
-                    finite_abs_mean = float(finite_values.abs().mean().item())
-                else:
-                    finite_abs_max = float("nan")
-                    finite_abs_mean = float("nan")
-                if len(bad_grads) < max_report:
-                    bad_grads.append(
-                        f"{name}: bad={bad_count}/{grad_detached.numel()}, "
-                        f"finite_abs_max={finite_abs_max:.4e}, finite_abs_mean={finite_abs_mean:.4e}"
-                    )
-                continue
-
-            local_norm = grad_detached.float().norm(2)
-            if not bool(torch.isfinite(local_norm).item()):
-                if len(bad_grads) < max_report:
-                    bad_grads.append(f"{name}: finite values but non-finite norm")
-                continue
-
-            total_sq_norm += float(local_norm.item()) ** 2
-
-        grad_norm = total_sq_norm ** 0.5
-        return bad_grads, grad_norm
     
     def train_one_epoch(self, epoch):
         self.model.train()
@@ -1103,12 +1057,7 @@ class BaseTrainer:
                     # Perform the forward using the accerlate
                     batch = move_to_device(batch, device=self.accelerator.device)
                     with self.accelerator.autocast():
-                        forward_output = self.forward_batch(
-                            batch,
-                            mode='train',
-                            current_epoch=epoch,
-                            total_epochs=self.cfg.train.num_epoch,
-                        )
+                        forward_output = self.forward_batch(batch, mode='train')
                     batch_output = self.calculate_loss(
                         forward_output, batch, mode='train', 
                         current_epoch=epoch, total_epochs=self.cfg.train.num_epoch
@@ -1138,44 +1087,23 @@ class BaseTrainer:
                                 loss_details_dict[item] = batch_output[item] / self.cfg.train.gradient_accumulation_steps if loss_value != 0 else 0.0
 
                     # clip the gradient
-                    grad_norm = 0.0
-                    skip_update = False
                     if self.accelerator.sync_gradients:
-                        bad_grads, pre_clip_grad_norm = self._inspect_gradients_before_clip()
-                        if bad_grads or not math.isfinite(float(pre_clip_grad_norm)):
-                            rank = get_rank()
-                            print(
-                                f"Rank {rank}: Gradient norm is {pre_clip_grad_norm}, skipping optimizer step at iter {it} "
-                                f"(epoch {epoch}, global step {self.global_step}).",
-                                force=True,
-                            )
-                            if bad_grads:
-                                print(
-                                    "Non-finite gradient parameters:\n  " + "\n  ".join(bad_grads),
-                                    force=True,
-                                )
-                            self._zero_optimizer_grad()
-                            loss_details_dict = {}
-                            skip_update = True
-                        else:
-                            params_to_clip = self.model.parameters()
-                            grad_norm_tensor = self.accelerator.clip_grad_norm_(
-                                params_to_clip, self.cfg.train.clip_grad
-                            )
-                            grad_norm = float(grad_norm_tensor.item() if hasattr(grad_norm_tensor, "item") else grad_norm_tensor)
-                            if not math.isfinite(float(grad_norm)):
-                                rank = get_rank()
-                                print(
-                                    f"Rank {rank}: Gradient norm became {grad_norm} during clipping, "
-                                    f"skipping optimizer step at iter {it} (epoch {epoch}, global step {self.global_step}).",
-                                    force=True,
-                                )
-                                self._zero_optimizer_grad()
-                                loss_details_dict = {}
-                                skip_update = True
+                        params_to_clip = self.model.parameters()
+                        self.accelerator.clip_grad_norm_(
+                            params_to_clip, self.cfg.train.clip_grad
+                        )
 
-                    if skip_update:
-                        continue
+                        def get_gradient_norm(parameters):
+                            norm = 0
+                            for param in parameters:
+                                if param.grad is None:
+                                    continue
+                                local_norm = param.grad.detach().data.norm(2)
+                                norm += local_norm.item() ** 2
+                            norm = norm**0.5
+                            return norm
+
+                        grad_norm = get_gradient_norm(self.model.parameters())
 
                     if self.accelerator.state.deepspeed_plugin is None:
                         self.optimizer.step()
@@ -1246,12 +1174,12 @@ class BaseTrainer:
         for tracker in self.accelerator.trackers:
             tracker.log_images(log_img, step)
 
-    def forward_batch(self, batch, mode='train', current_epoch=None, total_epochs=None):
+    def forward_batch(self, batch, mode='train'):
         output = self.model(batch)
         assert isinstance(output, EasyDict)
         return output
 
-    def calculate_loss(self, output, batch, mode='train', current_epoch=None, total_epochs=None):
+    def calculate_loss(self, output, batch, mode='train'):
         pass
 
     def build_accelerator(self):
@@ -1382,13 +1310,7 @@ class BaseTrainer:
             start_epoch = 0
         else:
             self.log_info(f"Resuming from checkpoint {path}")
-            if self.cfg.train.get('eval_only', False) and os.path.isdir(path) and not os.path.exists(os.path.join(path, "optimizer.bin")):
-                self.log_info(
-                    "optimizer.bin is missing in eval_only mode; loading model weights only."
-                )
-                self._load_model_only_checkpoint(path)
-            else:
-                self.accelerator.load_state(path)
+            self.accelerator.load_state(path)
             
             # Try to parse epoch from path, otherwise default to 0 for fine-tuning or evaluation.
             try:
@@ -1409,52 +1331,6 @@ class BaseTrainer:
                 start_epoch = 0
                 
         return start_epoch
-
-    def _load_model_only_checkpoint(self, path):
-        candidate_files = [
-            "pytorch_model.bin",
-            "model.safetensors",
-            "model.bin",
-            "pytorch_model.safetensors",
-        ]
-
-        weight_path = None
-        for filename in candidate_files:
-            candidate = os.path.join(path, filename)
-            if os.path.exists(candidate):
-                weight_path = candidate
-                break
-
-        if weight_path is None:
-            candidates = [
-                os.path.join(path, filename)
-                for filename in os.listdir(path)
-                if filename.endswith((".bin", ".pt", ".pth", ".safetensors"))
-            ]
-            candidates = [
-                filename for filename in candidates
-                if not os.path.basename(filename).startswith(("optimizer", "scheduler", "random_states"))
-            ]
-            if candidates:
-                weight_path = sorted(candidates)[0]
-
-        if weight_path is None:
-            raise FileNotFoundError(f"No model weight file found in checkpoint directory: {path}")
-
-        if weight_path.endswith(".safetensors"):
-            from safetensors.torch import load_file
-            state_dict = load_file(weight_path, device="cpu")
-        else:
-            state_dict = torch.load(weight_path, map_location="cpu")
-
-        model = self.accelerator.unwrap_model(self.model)
-        if isinstance(state_dict, dict) and "state_dict" in state_dict:
-            state_dict = state_dict["state_dict"]
-        if isinstance(state_dict, dict) and "model" in state_dict:
-            state_dict = state_dict["model"]
-
-        load_result = model.load_state_dict(state_dict, strict=False)
-        self.log_info(f"Loaded model-only checkpoint from {weight_path}: {load_result}")
 
     def log_info(self, info):
         if is_logging_process():

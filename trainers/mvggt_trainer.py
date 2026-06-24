@@ -11,7 +11,7 @@ class MVGGTTrainer(BaseTrainer):
         super().__init__(cfg)
 
         self.train_loss = hydra.utils.instantiate(cfg.loss.train_loss)
-        self.test_loss = hydra.utils.instantiate(cfg.loss.test_loss)
+        self.test_loss = hydra.utils.instantiate(cfg.loss.train_loss)
 
     def build_optimizer(self, cfg_optimizer, model):
         def param_group_fn(model_):
@@ -76,7 +76,7 @@ class MVGGTTrainer(BaseTrainer):
             for dataset in datasets:
                 dataset._set_resolutions(resolutions)
             
-    def forward_batch(self, batch, mode='train', current_epoch=None, total_epochs=None):
+    def forward_batch(self, batch, mode='train'):
         # Unpack the batch
         batched_views, batched_text = batch
 
@@ -84,27 +84,9 @@ class MVGGTTrainer(BaseTrainer):
         imgs = torch.stack([view['img'] for view in batched_views], dim=1)
         input_ids = batched_text['input_ids']
         attention_mask = batched_text['attention_mask']
-        gt_masks = None
-        if mode == 'train' and 'referring_mask' in batched_views[0]:
-            gt_masks = torch.stack([view['referring_mask'] for view in batched_views], dim=1)
-        camera_poses = None
-        camera_intrinsics = None
-        if 'camera_pose' in batched_views[0]:
-            camera_poses = torch.stack([view['camera_pose'] for view in batched_views], dim=1)
-        if 'camera_intrinsics' in batched_views[0]:
-            camera_intrinsics = torch.stack([view['camera_intrinsics'] for view in batched_views], dim=1)
 
         # Forward pass through the model
-        pred = self.model(
-            imgs,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            gt_masks=gt_masks,
-            camera_poses=camera_poses,
-            camera_intrinsics=camera_intrinsics,
-            current_epoch=current_epoch,
-            total_epochs=total_epochs,
-        )
+        pred = self.model(imgs, input_ids=input_ids, attention_mask=attention_mask)
         
         
         return [pred, batch]
@@ -114,7 +96,8 @@ class MVGGTTrainer(BaseTrainer):
         batched_views, batched_text = batch
 
         if mode == 'train':
-            loss, details = self.train_loss(output, batched_views, current_epoch=current_epoch, total_epochs=total_epochs)
+            loss, details = self.train_loss(output, batched_views)
+            #loss, details = self.train_loss(output, batched_views, current_epoch=current_epoch, total_epochs=total_epochs)
         else:
             loss, details = self.test_loss(output, batched_views)
 
