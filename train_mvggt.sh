@@ -3,11 +3,24 @@ set -euo pipefail
 
 export HYDRA_FULL_ERROR=1
 
-SCANNET_DATA_ROOT="${SCANNET_DATA_ROOT:-data/scannet_data}"
-SCANNET_SCANS_ROOT="${SCANNET_SCANS_ROOT:-}"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+SCANNET_ROOT="${SCANNET_ROOT:-/inspire/dataset/video3d-llm-data/v1/scannet}"
+SCANNET_DATA_ROOT="${SCANNET_DATA_ROOT:-${SCANNET_ROOT}/posed_images}"
+SCANNET_SCANS_ROOT="${SCANNET_SCANS_ROOT:-${PROJECT_ROOT}/scans}"
+
+if [ ! -d "$SCANNET_DATA_ROOT" ]; then
+    echo "ScanNet data root not found: $SCANNET_DATA_ROOT" >&2
+    echo "Set SCANNET_DATA_ROOT=/path/to/posed_images or SCANNET_ROOT=/path/to/scannet." >&2
+    exit 1
+fi
 
 SCANS_OVERRIDE=()
 if [ -n "$SCANNET_SCANS_ROOT" ]; then
+    if [ ! -d "$SCANNET_SCANS_ROOT" ]; then
+        echo "ScanNet scans root not found: $SCANNET_SCANS_ROOT" >&2
+        echo "Set SCANNET_SCANS_ROOT=/path/to/scans, or set it to empty if scans sit beside data_root." >&2
+        exit 1
+    fi
     SCANS_OVERRIDE=(
         train_dataset.ScanNet.scans_root="$SCANNET_SCANS_ROOT"
         test_dataset.ScanNet.scans_root="$SCANNET_SCANS_ROOT"
