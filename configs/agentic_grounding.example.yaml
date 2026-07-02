@@ -1,0 +1,27 @@
+agentic_grounding:
+  cache_root: cache/agentic_grounding
+  geometry:
+    backend: vggt_omega  # mvggt, vggt, or vggt_omega
+    checkpoint_path: ckpts/VGGT-Omega-1B-512/model.pt
+    image_resolution: 512
+    confidence_threshold: 0.0
+  perception:
+    mode: sam3_service  # sam3_service or grounding_dino_plus_sam
+    sam3_endpoint: http://127.0.0.1:8765/segment
+    grounding_dino_path: ckpts/grounding-dino-base
+    sam_checkpoint_path: ckpts/sam_vit_h_4b8939.pth
+    sam_model_type: vit_h
+    box_threshold: 0.20
+    text_threshold: 0.20
+  association:
+    voxel_size: 0.04
+    voxel_dilation: 1
+    min_pair_score: 0.38
+  vlm:
+    base_url: http://127.0.0.1:8000
+    model: your-local-vlm-name
+    api_key_env: VLM_API_KEY
+  agent:
+    planner: deterministic  # deterministic first, vlm later
+    budget: 8
+    stop_margin: 0.15
